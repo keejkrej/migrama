@@ -10,37 +10,89 @@ import typer
 app = typer.Typer(help="Migrama: A comprehensive toolkit for micropatterned timelapse microscopy analysis")
 
 
+def parse_fov_string(fov_string: str) -> list[int] | None:
+    """Parse FOV string like '1,3-5,8' into list [1,3,4,5,8].
+
+    Parameters
+    ----------
+    fov_string : str
+        FOV specification: 'all' for all FOVs, or comma-separated values/ranges
+
+    Returns
+    -------
+    list[int] | None
+        Sorted list of unique FOV indices, or None if 'all'
+    """
+    if fov_string.strip().lower() == "all":
+        return None
+
+    fovs = []
+    for part in fov_string.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            fovs.extend(range(int(start), int(end) + 1))
+        else:
+            fovs.append(int(part))
+    return sorted(set(fovs))
+
+
+def create_cell_source(path: str):
+    """Auto-detect and create the appropriate cell source based on file extension.
+
+    Parameters
+    ----------
+    path : str
+        Path to cells file (.nd2 or .tif/.tiff)
+
+    Returns
+    -------
+    CellFovSource
+        Either Nd2CellFovSource or TiffCellFovSource
+    """
+    from ..core.cell_source import Nd2CellFovSource, TiffCellFovSource
+
+    p = Path(path)
+    suffix = p.suffix.lower()
+
+    if suffix == ".nd2":
+        return Nd2CellFovSource(path)
+    elif suffix in (".tif", ".tiff"):
+        return TiffCellFovSource(path)
+    else:
+        raise typer.BadParameter(
+            f"Unsupported file format: {suffix}. Expected .nd2 or .tif/.tiff"
+        )
+
+
 @app.command()
 def pattern(
-    patterns: str | None = typer.Option(
-        None, "--patterns", "-p", help="Path to patterns ND2 file or per-FOV TIFF file (e.g., ./folder/xxx_0.tif)"
+    patterns: str = typer.Option(
+        ..., "--patterns", "-p", help="Path to patterns file (.nd2) or folder of TIFFs"
     ),
-    output: str = typer.Option("./patterns.csv", "--output", "-o", help="Output CSV file path"),
-    avg: bool = typer.Option(False, "--avg", help="Interpret --patterns as per-FOV TIFF file path"),
-    fov: int | None = typer.Option(None, "--fov", help="Process only this FOV (default: all FOVs)"),
+    output: str = typer.Option(..., "--output", "-o", help="Output CSV file path"),
+    fovs: str = typer.Option(..., "--fovs", help="FOVs to process: 'all' or ranges like '1,3-5,8' (required)"),
+    plot: str | None = typer.Option(None, "--plot", help="Output folder for bbox overlay plots (one PNG per FOV)"),
     debug: bool = typer.Option(False, "--debug"),
 ):
     """Detect micropatterns and save bounding boxes to CSV.
 
-    Use -p/--patterns for dedicated pattern files, or with --avg for
-    pre-averaged TIFFs. Output CSV format: cell,fov,x,y,w,h
-    """
-    if patterns is None:
-        typer.echo("Error: --patterns/-p is required", err=True)
-        raise typer.Exit(1)
+    Accepts either an ND2 file or a folder of pre-averaged TIFFs (auto-detected).
+    Output CSV format: cell,fov,x,y,w,h
 
+    Use --plot to generate visualization of detected bboxes overlaid on
+    the pattern images (one PNG per FOV).
+    """
     log_level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s - %(name)s - %(message)s")
 
-    if avg:
-        patterns_path = Path(patterns)
-        if not patterns_path.exists():
-            typer.echo(f"Error: Path does not exist: {patterns}", err=True)
-            raise typer.Exit(1)
-        if not patterns_path.is_dir():
-            typer.echo("Error: --avg requires a folder, not a file", err=True)
-            raise typer.Exit(1)
+    patterns_path = Path(patterns)
+    if not patterns_path.exists():
+        typer.echo(f"Error: Path does not exist: {patterns}", err=True)
+        raise typer.Exit(1)
 
+    # Auto-detect source type based on path
+    if patterns_path.is_dir():
         from ..core.pattern.source import TiffPatternFovSource
 
         source = TiffPatternFovSource(patterns_path)
@@ -53,15 +105,47 @@ def pattern(
 
     detector = PatternDetector(source=source)
 
-    if fov is not None:
-        records = detector.detect_fov(fov)
-        typer.echo(f"Detected {len(records)} patterns in FOV {fov}")
+    # Parse --fovs (required): 'all' or ranges like '1,3-5,8'
+    try:
+        fov_filter = parse_fov_string(fovs)
+    except ValueError:
+        typer.echo(f"Error: Invalid --fovs format: {fovs}. Expected 'all' or ranges like '1,3-5,8'", err=True)
+        raise typer.Exit(1) from None
+
+    if fov_filter is not None and len(fov_filter) == 1:
+        records = detector.detect_fov(fov_filter[0])
+        typer.echo(f"Detected {len(records)} patterns in FOV {fov_filter[0]}")
+    elif fov_filter is not None:
+        records = detector.detect_all(fov_filter=fov_filter)
+        typer.echo(f"Detected {len(records)} patterns across {len(fov_filter)} FOVs")
     else:
         records = detector.detect_all()
         typer.echo(f"Detected {len(records)} patterns across {detector.n_fovs} FOVs")
 
     detector.save_csv(records, output)
     typer.echo(f"Saved to: {output}")
+
+    # Generate bbox overlay plots if requested
+    if plot is not None:
+        from ..utils.plot import plot_pattern_bboxes
+
+        plot_dir = Path(plot)
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Group records by FOV
+        records_by_fov: dict[int, list] = {}
+        for r in records:
+            records_by_fov.setdefault(r.fov, []).append(r)
+
+        # Generate plot for each FOV
+        for fov_idx, frame in source.iter_fovs():
+            if fov_idx not in records_by_fov:
+                continue
+
+            out_path = plot_dir / f"fov_{fov_idx:03d}.png"
+            plot_pattern_bboxes(frame, records_by_fov[fov_idx], fov_idx, out_path)
+
+        typer.echo(f"Saved {len(records_by_fov)} plots to: {plot_dir}")
 
 
 @app.command()
@@ -73,16 +157,14 @@ def average(
     output_dir: str = typer.Option(".", "--output-dir", help="Output directory for averaged TIFFs"),
     debug: bool = typer.Option(False, "--debug"),
 ):
-    """Average time-lapse data to enhance pattern contrast.
-
-    Outputs one averaged TIFF per FOV (patterns_avg_fov_{fov}.tif) in the
-    specified output directory. Useful for detecting patterns from phase
-    contrast images without a dedicated pattern file.
-    """
+    """Average phase contrast time-lapse frames to generate pattern images when no dedicated patterns.nd2 was recorded."""
     log_level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s - %(name)s - %(message)s")
 
+    from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
+
     from ..core.pattern import PatternAverager
+    from ..core.progress import ProgressEvent
 
     averager = PatternAverager(
         cells_path=cells,
@@ -91,48 +173,73 @@ def average(
         t1=t1,
         output_dir=output_dir,
     )
-    output_paths = averager.run()
-    typer.echo(f"Averaged {len(output_paths)} FOVs to {output_dir}")
+
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        transient=True,
+    )
+    progress.start()
+
+    tasks: dict[str, TaskID] = {}
+
+    def handle_progress(event: ProgressEvent) -> None:
+        if event.state not in tasks:
+            tasks[event.state] = progress.add_task(
+                f"{event.state} ({event.iterator})",
+                total=event.total or 1,
+            )
+        task_id = tasks[event.state]
+        progress.update(task_id, completed=event.current)
+
+    averager.progress.connect(handle_progress)
+
+    try:
+        output_paths = averager.run()
+        progress.stop()
+        typer.echo(f"Averaged {len(output_paths)} FOVs to {output_dir}")
+    except Exception:
+        progress.stop()
+        raise
 
 
 @app.command()
 def analyze(
     cells: str = typer.Option(
-        ..., "--cells", "-c", help="Path to cells ND2 file or per-FOV TIFF file (e.g., ./folder/xxx_0.tif)"
+        ..., "--cells", "-c", help="Path to cells file (.nd2 or .tif/.tiff)"
     ),
     csv: str = typer.Option(..., "--csv", help="Path to patterns CSV file"),
-    cache: str = typer.Option(..., "--cache", help="Output cache.ome.zarr path for mask storage"),
-    output: str = typer.Option("./analysis.csv", "--output", "-o", help="Output CSV file path"),
-    nuclei_channel: int = typer.Option(1, "--nc", help="Channel index for nuclei"),
-    cell_channels: str = typer.Option(..., "--cc", help="Comma-separated cell channel indices (e.g., '0' or '1,2')"),
-    merge_method: str = typer.Option("none", "--merge-method", help="Channel merge method: 'add', 'multiply', or 'none'"),
-    n_cells: int = typer.Option(4, "--n-cells", help="Target number of cells per pattern"),
-    tiff: bool = typer.Option(False, "--tiff", help="Interpret --cells as per-FOV TIFF file path"),
+    cache: str | None = typer.Option(None, "--cache", help="Output cache.ome.zarr path for cell mask storage (optional)"),
+    output: str = typer.Option(..., "--output", "-o", help="Output CSV file path"),
+    nuclei_channel: int = typer.Option(1, "--nc", help="Channel index for nuclei (stored for extract step)"),
+    cell_channels: str | None = typer.Option(None, "--cc", help="Comma-separated cell channel indices (metadata only, not used for segmentation)"),
+    merge_method: str = typer.Option("none", "--merge-method", help="Channel merge method (metadata only, not used)"),
+    n_cells: int = typer.Option(..., "--n-cells", help="Target number of cells per pattern (required)"),
+    allowed_gap: int = typer.Option(6, "--allowed-gap", help="Maximum consecutive non-target frames to bridge over"),
     debug: bool = typer.Option(False, "--debug"),
 ):
-    """Analyze cell counts, cache masks, and output t0/t1 ranges."""
+    """Analyze cell counts using all-channel segmentation.
+
+    Segments cells using all channels (Cellpose all-channel mode), counts
+    cells per frame, and caches masks for the extract step.
+    """
     log_level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s - %(name)s - %(message)s")
 
-    # Parse cell_channels
-    try:
-        cell_channels_list = [int(x.strip()) for x in cell_channels.split(",")]
-    except ValueError:
-        typer.echo(f"Error: Invalid --cc format: {cell_channels}. Expected comma-separated integers (e.g., '0' or '1,2')", err=True)
-        raise typer.Exit(1) from None
-
-    # Validate merge_method
-    if merge_method not in ('add', 'multiply', 'none'):
-        typer.echo(f"Error: Invalid --merge-method: {merge_method}. Must be 'add', 'multiply', or 'none'", err=True)
-        raise typer.Exit(1)
+    # Parse cell_channels (optional, metadata only)
+    cell_channels_list: list[int] | None = None
+    if cell_channels is not None:
+        try:
+            cell_channels_list = [int(x.strip()) for x in cell_channels.split(",")]
+        except ValueError:
+            typer.echo(f"Error: Invalid --cc format: {cell_channels}. Expected comma-separated integers (e.g., '0' or '1,2')", err=True)
+            raise typer.Exit(1) from None
 
     from ..analyze import Analyzer
-    from ..core.cell_source import Nd2CellFovSource, TiffCellFovSource
 
-    if tiff:
-        source = TiffCellFovSource(cells)
-    else:
-        source = Nd2CellFovSource(cells)
+    source = create_cell_source(cells)
 
     analyzer = Analyzer(
         source=source,
@@ -142,50 +249,55 @@ def analyze(
         cell_channels=cell_channels_list,
         merge_method=merge_method,
         n_cells=n_cells,
+        allowed_gap=allowed_gap,
     )
     records = analyzer.analyze(output)
     typer.echo(f"Saved {len(records)} records to {output}")
-    typer.echo(f"Cached masks to {cache}")
+    if cache:
+        typer.echo(f"Cached masks to {cache}")
 
 
 @app.command()
 def extract(
     cells: str = typer.Option(
-        ..., "--cells", "-c", help="Path to cells ND2 file or per-FOV TIFF file (e.g., ./folder/xxx_0.tif)"
+        ..., "--cells", "-c", help="Path to cells file (.nd2 or .tif/.tiff)"
     ),
     csv: str = typer.Option(..., "--csv", help="Path to analysis CSV file"),
-    output: str = typer.Option("./extracted.zarr", "--output", "-o", help="Output Zarr store path"),
-    nuclei_channel: int = typer.Option(1, "--nc", help="Channel index for nuclei"),
-    cell_channels: str = typer.Option(..., "--cc", help="Comma-separated cell channel indices (e.g., '0' or '1,2')"),
-    merge_method: str = typer.Option("none", "--merge-method", help="Channel merge method: 'add', 'multiply', or 'none'"),
-    cache: str = typer.Option(None, "--cache", help="Path to cache.ome.zarr with pre-computed cell masks"),
-    min_frames: int = typer.Option(1, "--min-frames", help="Minimum frames per sequence"),
-    tiff: bool = typer.Option(False, "--tiff", help="Interpret --cells as per-FOV TIFF file path"),
+    output: str = typer.Option(..., "--output", "-o", help="Output Zarr store path"),
+    nuclei_channel: int = typer.Option(1, "--nc", help="Channel index for nuclei (used to derive nuclei within cells)"),
+    cell_channels: str | None = typer.Option(None, "--cc", help="Comma-separated cell channel indices (metadata only)"),
+    merge_method: str = typer.Option("none", "--merge-method", help="Channel merge method (metadata only)"),
+    cache: str | None = typer.Option(None, "--cache", help="Path to cache.ome.zarr with pre-computed cell masks (explicit opt-in)"),
+    min_frames: int = typer.Option(20, "--min-frames", help="Minimum frames per sequence"),
     debug: bool = typer.Option(False, "--debug"),
 ):
-    """Extract sequences with segmentation and tracking."""
+    """Extract sequences with cell-first tracking.
+
+    Cell-first workflow: segment cells (all channels) → track cells across
+    frames → derive nuclei by Otsu thresholding within each tracked cell.
+
+    Without --cache, cells are re-segmented from the source data.
+    """
     log_level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s - %(name)s - %(message)s")
 
-    # Parse cell_channels (required)
-    try:
-        cell_channels_list = [int(x.strip()) for x in cell_channels.split(",")]
-    except ValueError:
-        typer.echo(f"Error: Invalid --cc format: {cell_channels}. Expected comma-separated integers (e.g., '0' or '1,2')", err=True)
-        raise typer.Exit(1) from None
+    # Parse cell_channels (optional, metadata only)
+    cell_channels_list: list[int] | None = None
+    if cell_channels is not None:
+        try:
+            cell_channels_list = [int(x.strip()) for x in cell_channels.split(",")]
+        except ValueError:
+            typer.echo(f"Error: Invalid --cc format: {cell_channels}. Expected comma-separated integers (e.g., '0' or '1,2')", err=True)
+            raise typer.Exit(1) from None
 
     # Validate merge_method
     if merge_method not in ('add', 'multiply', 'none'):
         typer.echo(f"Error: Invalid --merge-method: {merge_method}. Must be 'add', 'multiply', or 'none'", err=True)
         raise typer.Exit(1)
 
-    from ..core.cell_source import Nd2CellFovSource, TiffCellFovSource
     from ..extract import Extractor
 
-    if tiff:
-        source = TiffCellFovSource(cells)
-    else:
-        source = Nd2CellFovSource(cells)
+    source = create_cell_source(cells)
 
     extractor = Extractor(
         source=source,
@@ -207,10 +319,10 @@ def convert(
     nuclei_channel: int = typer.Option(0, "--nc", help="Channel index for nuclei"),
     cell_channels: str | None = typer.Option(None, "--cell-channels", "--cc", help="Comma-separated cell channel indices (e.g., '1,2')"),
     merge_method: str = typer.Option("none", "--merge-method", help="Channel merge method: 'add', 'multiply', or 'none'"),
-    min_frames: int = typer.Option(1, "--min-frames", help="Minimum frames per sequence"),
+    min_frames: int = typer.Option(20, "--min-frames", help="Minimum frames per sequence"),
     debug: bool = typer.Option(False, "--debug"),
 ):
-    """Convert TIFF files to OME-Zarr with segmentation and tracking."""
+    """Convert TIFF files to Zarr with segmentation and tracking."""
     log_level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s - %(name)s - %(message)s")
 
@@ -393,8 +505,7 @@ def graph(
     input: str = typer.Option(..., "--input", "-i", help="Path to Zarr store with extracted data"),
     output: str = typer.Option(..., "--output", "-o", help="Output directory for plots"),
     fov: int = typer.Option(..., "--fov", help="FOV index"),
-    pattern: int = typer.Option(..., "--pattern", help="Pattern index"),
-    sequence: int = typer.Option(..., "--sequence", help="Sequence index"),
+    pattern: int = typer.Option(..., "--pattern", help="Pattern/cell index"),
     start_frame: int | None = typer.Option(None, "--start-frame", "-s", help="Starting frame (default: 0)"),
     end_frame: int | None = typer.Option(None, "--end-frame", "-e", help="Ending frame (exclusive, default: all)"),
     plot: bool = typer.Option(False, "--plot", help="Generate boundary visualization plots"),
@@ -421,8 +532,8 @@ def graph(
     loader = ZarrSegmentationLoader()
     tracker = BoundaryPixelTracker()
 
-    typer.echo(f"Loading sequence: FOV {fov}, Pattern {pattern}, Sequence {sequence}")
-    loaded_data = loader.load_cell_filter_data(input, fov, pattern, sequence, None)
+    typer.echo(f"Loading sequence: FOV {fov}, Pattern {pattern}")
+    loaded_data = loader.load_cell_filter_data(input, fov, pattern)
     segmentation_masks = np.asarray(loaded_data["segmentation_masks"])
     nuclei_masks = np.asarray(loaded_data["nuclei_masks"]) if loaded_data["nuclei_masks"] is not None else None
 
@@ -484,9 +595,9 @@ def info(  # noqa: C901
     output: str | None = typer.Option(None, "--output", "-o", help="Save plot to PNG file"),
 ):
     """Print Zarr store structure or plot a dataset slice."""
-    import zarr
     import matplotlib.pyplot as plt
     import numpy as np
+    import zarr
 
     path = Path(input)
     if not path.exists():
@@ -568,9 +679,33 @@ def info(  # noqa: C901
         print_zarr_tree(root)
 
 
+
+@app.command()
+def save(
+    zarr_path: str = typer.Option(..., "--zarr", "-z", help="Path to input Zarr store"),
+    output: str = typer.Option(..., "--output", "-o", help="Output directory for TIFF files"),
+):
+    """Export zarr sequences to TIFF files.
+
+    Creates two files per sequence:
+    - fov_XXXX_cell_XXXX_data.tiff: Image data (T, C, H, W)
+    - fov_XXXX_cell_XXXX_mask.tiff: Masks (T, 2, H, W) where ch0=cell, ch1=nucleus
+    """
+    from pathlib import Path
+
+    from ..core.io.tiff_export import export_zarr_to_tiff
+
+    zarr_p = Path(zarr_path)
+    if not zarr_p.exists():
+        typer.echo(f"Error: Zarr store not found: {zarr_path}", err=True)
+        raise typer.Exit(1)
+
+    count = export_zarr_to_tiff(zarr_p, Path(output))
+    typer.echo(f"Saved {count} sequences to {output}")
+
 @app.command()
 def viewer():
-    """Launch the interactive NPY viewer."""
+    """Launch the interactive Zarr viewer."""
     from PySide6.QtWidgets import QApplication
 
     from ..viewer.ui.main_window import MainWindow
