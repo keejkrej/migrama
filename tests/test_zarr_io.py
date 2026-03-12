@@ -128,6 +128,37 @@ class TestZarrIO:
         assert "nucleus" in mask
         assert "cell" in mask
 
+    def test_sequence_uses_requested_shards_and_chunks(self, tmp_path):
+        """Test data and masks use frame-sharded, full-frame chunk layout."""
+        zarr_path = tmp_path / "test.zarr"
+        root = create_zarr_store(zarr_path)
+        write_global_metadata(root, "TestSource", 0, [1], "none")
+
+        data = np.zeros((100, 2, 8, 8), dtype=np.uint16)
+        nuclei_masks = np.zeros((100, 8, 8), dtype=np.int32)
+        cell_masks = np.zeros((100, 8, 8), dtype=np.int32)
+
+        write_sequence(
+            root,
+            fov_idx=0,
+            cell_idx=0,
+            data=data,
+            nuclei_masks=nuclei_masks,
+            cell_masks=cell_masks,
+            channels=["channel_0", "channel_1"],
+            t0=0,
+            t1=99,
+            bbox=np.array([0, 0, 8, 8], dtype=np.int32),
+        )
+
+        data = root["fov/0/cell/0/data"]
+        assert data.shards == (64, 2, 8, 8)
+        assert data.chunks == (1, 1, 8, 8)
+
+        cell_mask = root["fov/0/cell/0/mask/cell"]
+        assert cell_mask.shards == (64, 8, 8)
+        assert cell_mask.chunks == (1, 8, 8)
+
 
 class TestZarrLoader:
     """Tests for ZarrSegmentationLoader."""

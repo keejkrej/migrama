@@ -12,6 +12,18 @@ import zarr
 MIGRAMA_VERSION = "0.1.0"
 
 
+def _data_layout(shape: tuple[int, int, int, int]) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Return shard and chunk shapes for image data arrays."""
+    t, c, h, w = shape
+    return (min(64, t), c, h, w), (1, 1, h, w)
+
+
+def _mask_layout(shape: tuple[int, int, int]) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Return shard and chunk shapes for label mask arrays."""
+    t, h, w = shape
+    return (min(64, t), h, w), (1, h, w)
+
+
 def create_zarr_store(path: str | Path, overwrite: bool = False) -> zarr.Group:
     """Create a new Zarr store for migrama data.
 
@@ -105,15 +117,15 @@ def write_sequence(
     fov_group = root.require_group(f"fov/{fov_idx}")
     cell_group = fov_group.require_group(f"cell/{cell_idx}")
 
-    # Determine chunks - optimize for frame-by-frame access
-    t, c, h, w = data.shape
-    data_chunks = (1, 1, min(256, h), min(256, w))
-    mask_chunks = (1, min(256, h), min(256, w))
+    # Store full frames as inner chunks and group up to 64 frames per shard.
+    data_shards, data_chunks = _data_layout(data.shape)
+    mask_shards, mask_chunks = _mask_layout(cell_masks.shape)
 
     # Write image data
     arr = cell_group.create_array(
         "data",
         shape=data.shape,
+        shards=data_shards,
         chunks=data_chunks,
         dtype=data.dtype,
         overwrite=True,
@@ -131,14 +143,15 @@ def write_sequence(
     # Write masks: cell_group/mask/{nucleus, cell}
     mask_group = cell_group.require_group("mask")
 
-    _write_label_array(mask_group, "nucleus", nuclei_masks, mask_chunks)
-    _write_label_array(mask_group, "cell", cell_masks, mask_chunks)
+    _write_label_array(mask_group, "nucleus", nuclei_masks, mask_shards, mask_chunks)
+    _write_label_array(mask_group, "cell", cell_masks, mask_shards, mask_chunks)
 
 
 def _write_label_array(
     parent_group: zarr.Group,
     name: str,
     data: np.ndarray,
+    shards: tuple[int, ...],
     chunks: tuple[int, ...],
 ) -> None:
     """Write a label array directly under the parent group.
@@ -151,6 +164,8 @@ def _write_label_array(
         Array name (e.g., "nucleus", "cell")
     data : np.ndarray
         Label data with shape (T, H, W)
+    shards : tuple[int, ...]
+        Shard sizes
     chunks : tuple
         Chunk sizes
     """
@@ -158,6 +173,7 @@ def _write_label_array(
     arr = parent_group.create_array(
         name,
         shape=label_data.shape,
+        shards=shards,
         chunks=chunks,
         dtype=np.int32,
         overwrite=True,
