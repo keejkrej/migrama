@@ -27,6 +27,7 @@ class DetectorParameters:
     morph_dilate_size: tuple[int, int] = (5, 5)
     edge_tolerance: int = 5
     min_area_ratio: float = 1 / 3  # Discard contours with area < median * min_area_ratio
+    bbox_margin: int = 0
 
 
 @dataclass
@@ -61,6 +62,8 @@ class PatternDetector:
         """
         self.source = source
         self.parameters = parameters or DetectorParameters()
+        if self.parameters.bbox_margin < 0:
+            raise ValueError("bbox_margin must be non-negative")
         self.n_fovs = source.n_fovs
 
         logger.info(f"Initialized PatternDetector with {self.n_fovs} FOVs")
@@ -114,14 +117,38 @@ class PatternDetector:
                 kept.append(c)
         return kept
 
-    def _contours_to_bboxes(self, contours: list[np.ndarray]) -> list[tuple[int, int, int, int]]:
+    def _expand_bbox(
+        self,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        image_shape: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        """Expand a bounding box by a fixed margin and clip it to the image."""
+        margin = self.parameters.bbox_margin
+        image_h, image_w = image_shape
+
+        x0 = max(0, x - margin)
+        y0 = max(0, y - margin)
+        x1 = min(image_w, x + w + margin)
+        y1 = min(image_h, y + h + margin)
+
+        return x0, y0, x1 - x0, y1 - y0
+
+    def _contours_to_bboxes(
+        self,
+        contours: list[np.ndarray],
+        image_shape: tuple[int, int],
+    ) -> list[tuple[int, int, int, int]]:
         """Convert contours to sorted bounding boxes."""
         bboxes = []
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
             center_y = y + h // 2
             center_x = x + w // 2
-            bboxes.append((x, y, w, h, center_y, center_x))
+            expanded_bbox = self._expand_bbox(x, y, w, h, image_shape)
+            bboxes.append((*expanded_bbox, center_y, center_x))
 
         bboxes.sort(key=lambda b: (b[4], b[5]))
         return [(x, y, w, h) for x, y, w, h, _, _ in bboxes]
@@ -156,7 +183,7 @@ class PatternDetector:
         # Filter edge first, then area
         contours = self._filter_by_edge(contours, normalized.shape)
         contours = self._filter_contours_by_area(contours)
-        bboxes = self._contours_to_bboxes(contours)
+        bboxes = self._contours_to_bboxes(contours, normalized.shape)
 
         records = []
         for cell_idx, (x, y, w, h) in enumerate(bboxes):
