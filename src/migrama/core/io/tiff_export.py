@@ -66,9 +66,10 @@ def export_zarr_to_tiff(zarr_path: Path | str, output_dir: Path | str) -> int:
             data_path = output_dir / f"{base_name}_data.tiff"
             mask_path = output_dir / f"{base_name}_mask.tiff"
 
-            # Write TIFF files
-            tifffile.imwrite(data_path, data)
-            tifffile.imwrite(mask_path, mask)
+            # Write TIFF files with explicit grayscale photometric interpretation
+            # to prevent 3-channel data from being interpreted as RGB
+            tifffile.imwrite(data_path, data, photometric="minisblack")
+            tifffile.imwrite(mask_path, mask, photometric="minisblack")
 
             count += 1
 
