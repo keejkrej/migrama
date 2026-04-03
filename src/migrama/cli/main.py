@@ -72,6 +72,7 @@ def pattern(
     ),
     output: str = typer.Option(..., "--output", "-o", help="Output CSV file path"),
     fovs: str = typer.Option(..., "--fovs", help="FOVs to process: 'all' or ranges like '1,3-5,8' (required)"),
+    margin: int = typer.Option(0, "--margin", min=0, help="Extra margin in pixels to add around each detected bbox"),
     plot: str | None = typer.Option(None, "--plot", help="Output folder for bbox overlay plots (one PNG per FOV)"),
     debug: bool = typer.Option(False, "--debug"),
 ):
@@ -101,9 +102,9 @@ def pattern(
 
         source = Nd2PatternFovSource(patterns)
 
-    from ..core.pattern import PatternDetector
+    from ..core.pattern import DetectorParameters, PatternDetector
 
-    detector = PatternDetector(source=source)
+    detector = PatternDetector(source=source, parameters=DetectorParameters(bbox_margin=margin))
 
     # Parse --fovs (required): 'all' or ranges like '1,3-5,8'
     try:
@@ -148,7 +149,6 @@ def pattern(
         typer.echo(f"Saved {len(records_by_fov)} plots to: {plot_dir}")
 
 
-@app.command()
 def average(
     cells: str = typer.Option(..., "--cells", "-c", help="Path to cells ND2 file"),
     cell_channel: int = typer.Option(0, "--cc", help="Channel index for cell bodies (phase contrast)"),
@@ -483,7 +483,6 @@ def convert(
 #             os.unlink(tmp_yaml_path)
 
 
-@app.command()
 def tension(
     mask: str = typer.Option(..., "--mask", help="Path to segmentation mask .npy file"),
     output: str | None = typer.Option(None, "--output", "-o", help="Path to save the VMSI model (pickle)"),
@@ -527,7 +526,6 @@ def tension(
         typer.echo("VMSI analysis completed (model not saved)")
 
 
-@app.command()
 def graph(
     input: str = typer.Option(..., "--input", "-i", help="Path to Zarr store with extracted data"),
     output: str = typer.Option(..., "--output", "-o", help="Output directory for plots"),
@@ -615,7 +613,6 @@ def graph(
         raise
 
 
-@app.command()
 def info(  # noqa: C901
     input: str = typer.Option(..., "--input", "-i", help="Path to Zarr store"),
     plot: str | None = typer.Option(None, "--plot", "-p", help="Plot a dataset slice: 'path,(dim0,dim1,...)'"),
@@ -730,7 +727,6 @@ def save(
     count = export_zarr_to_tiff(zarr_p, Path(output))
     typer.echo(f"Saved {count} sequences to {output}")
 
-@app.command()
 def viewer():
     """Launch the interactive Zarr viewer."""
     from PySide6.QtWidgets import QApplication

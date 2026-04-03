@@ -1,5 +1,8 @@
 [build-system]
-requires = ["hatchling"]
+requires = [
+    "hatchling",
+    "pathspec<1.0.0",
+]
 build-backend = "hatchling.build"
 
 [project]
@@ -39,6 +42,7 @@ dependencies = [
     "PySide6",
     "psygnal>=0.15.1",
     "ipykernel>=7.1.0",
+    "markdown-it-py<4",
 ]
 
 [project.scripts]
